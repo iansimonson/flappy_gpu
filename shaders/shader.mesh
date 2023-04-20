@@ -1,0 +1,44 @@
+#version 460
+#extension GL_EXT_mesh_shader : require
+
+layout (binding = 0) uniform UBO {
+    mat4 bird_translation;
+    mat4 column0_translation;
+    mat4 column1_translation1;
+} column_ubo;
+
+layout (local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout (triangles, max_vertices = 48, max_primitives = 16) out;
+
+layout (location = 0) out VertexOutput {
+    vec4 color;
+} vertexColorOutput[];
+
+const vec2[4] column_offsets = {
+    vec2(-0.1, -1), vec2(-0.1, -0.1),
+    vec2(0.1, -1), vec2(0.1, -0.1)
+};
+
+void main()
+{
+    vec3 upper_left_corner = vec3(column_offsets[0], 1.0);
+    vec3 bottom_left_corner = vec3(column_offsets[1], 1.0);
+    vec3 upper_right_corner = vec3(column_offsets[2], 1.0);
+    vec3 bottom_right_corner = vec3(column_offsets[3], 1.0);
+    mat3 translation_matrix = mat3(column_ubo.column0_translation);
+
+    SetMeshOutputsEXT(6, 2);
+    gl_MeshVerticesEXT[0].gl_Position = vec4((translation_matrix * upper_left_corner).xy, 0.0, 1.0);
+    gl_MeshVerticesEXT[1].gl_Position = vec4((translation_matrix * upper_right_corner).xy, 0.0, 1.0);
+    gl_MeshVerticesEXT[2].gl_Position = vec4((translation_matrix * bottom_left_corner).xy, 0.0, 1.0);
+    gl_MeshVerticesEXT[3].gl_Position = vec4((translation_matrix * upper_right_corner).xy, 0.0, 1.0);
+    gl_MeshVerticesEXT[4].gl_Position = vec4((translation_matrix * bottom_right_corner).xy, 0.0, 1.0);
+    gl_MeshVerticesEXT[5].gl_Position = vec4((translation_matrix * bottom_left_corner).xy, 0.0, 1.0);
+    vertexColorOutput[0].color = vec4(0.0, 1.0, 0.0, 1.0);
+    vertexColorOutput[1].color = vec4(0.0, 1.0, 0.0, 1.0);
+    vertexColorOutput[2].color = vec4(0.0, 1.0, 0.0, 1.0);
+    vertexColorOutput[3].color = vec4(0.0, 1.0, 0.0, 1.0);
+    vertexColorOutput[4].color = vec4(0.0, 1.0, 0.0, 1.0);
+    vertexColorOutput[5].color = vec4(0.0, 1.0, 0.0, 1.0);
+
+}
