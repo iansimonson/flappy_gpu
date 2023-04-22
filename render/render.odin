@@ -98,6 +98,9 @@ DEFAULT_THREAD_CAPACITY :: 4
 global_command_pools: [dynamic]vk.CommandPool
 global_command_buffers: [dynamic][MAX_FRAMES_IN_FLIGHT]vk.CommandBuffer
 
+// Gets a WriterHandle which is necessary to write commands
+// into a command buffer. Each writer needs a handle (they may be the same)
+// and should just treat it as an opaque type
 register_writer :: proc() -> WriterHandle {
     if _thread_global_handle == {} {
         current_value := sync.atomic_load(&_global_atomic_counter)
@@ -111,6 +114,109 @@ register_writer :: proc() -> WriterHandle {
     }
     
     return _thread_global_handle
+}
+
+get_command_buffer :: proc(writer: WriterHandle, current_frame: int) -> vk.CommandBuffer {
+    assert(writer != WriterHandle{})
+    buffer := global_command_buffers[int(writer - 1)][current_frame]
+    vk.ResetCommandBuffer(buffer, {})
+    return buffer;
+}
+
+global_render_create_texture :: proc(image: Image) -> Texture {
+    return renderer_create_texture(global_renderer, image)
+}
+
+global_render_destroy_texture :: proc(texture: Texture) {
+    renderer_destroy_texture(global_renderer, texture)
+}
+
+renderer_create_texture :: proc(renderer: Renderer, image: Image) -> Texture {
+    image_data_as_bytes := slice.to_bytes(image.data)
+    image_bytes_len := vk.DeviceSize(len(image_data_as_bytes))
+    staging_buffer, staging_memory := create_buffer(renderer.physical_device, renderer.device, image_bytes_len, {.TRANSFER_SRC}, {.HOST_VISIBLE, .HOST_COHERENT})
+    defer destroy_buffer(renderer.device, staging_buffer, staging_memory)
+
+    data: rawptr
+    vk.MapMemory(renderer.device, staging_memory, 0, image_bytes_len, nil, &data)
+    mem.copy(data, raw_data(image_data_as_bytes), int(image_bytes_len))
+    vk.UnmapMemory(renderer.device, staging_memory)
+
+    texture, texture_memory := create_image(renderer.physical_device, renderer.device, u32(image.width), u32(image.height), 1, .R8G8B8A8_UNORM, .OPTIMAL, {.TRANSFER_DST, .SAMPLED, .STORAGE}, {.DEVICE_LOCAL})
+    
+    command_buffer := scoped_single_time_commands(renderer.device, global_command_pools[int(_thread_global_handle)], renderer.main_queue)
+	// transition to transfer_dst_optimal
+    vk.CmdPipelineBarrier(command_buffer, {.TOP_OF_PIPE}, {.TRANSFER}, {}, 0, nil, 0, nil, 1, &vk.ImageMemoryBarrier{
+		sType = .IMAGE_MEMORY_BARRIER,
+		oldLayout = .UNDEFINED,
+		newLayout = .TRANSFER_DST_OPTIMAL,
+		srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+		dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+		image = texture,
+		subresourceRange = {
+			aspectMask = {.COLOR},
+			baseMipLevel = 0,
+			levelCount = 1,
+			baseArrayLayer = 0,
+			layerCount = 1,
+		},
+		srcAccessMask = nil,
+		dstAccessMask = nil,
+	})
+
+    // copy staging buffer to texture
+	vk.CmdCopyBufferToImage(command_buffer, staging_buffer, texture, .TRANSFER_DST_OPTIMAL, 1, &vk.BufferImageCopy{
+		bufferOffset = 0,
+		bufferRowLength = 0,
+		bufferImageHeight = 0,
+
+		imageSubresource = {
+			aspectMask = {.COLOR},
+			mipLevel = 0,
+			baseArrayLayer = 0,
+			layerCount = 1,
+		},
+
+		imageOffset = {0, 0, 0},
+		imageExtent = {u32(image.width), u32(image.height), 1},
+
+	})
+
+    vk.CmdPipelineBarrier(command_buffer, {.TRANSFER}, {.FRAGMENT_SHADER}, {}, 0, nil, 0, nil, 1, &vk.ImageMemoryBarrier{
+		sType = .IMAGE_MEMORY_BARRIER,
+		oldLayout = .TRANSFER_DST_OPTIMAL,
+		newLayout = .SHADER_READ_ONLY_OPTIMAL,
+		srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+		dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
+		image = texture,
+		subresourceRange = {
+			aspectMask = {.COLOR},
+			baseMipLevel = 0,
+			levelCount = 1,
+			baseArrayLayer = 0,
+			layerCount = 1,
+		},
+		srcAccessMask = {.TRANSFER_WRITE},
+		dstAccessMask = {.SHADER_READ},
+	})
+
+    texture_image_view := create_image_view(renderer.device, texture, .R8G8B8A8_UNORM, {.COLOR}, 1)
+
+    return {image = texture, image_view = texture_image_view, image_memory = texture_memory}
+}
+
+renderer_destroy_texture :: proc(renderer: Renderer, texture: Texture) {
+    defer vk.FreeMemory(renderer.device, texture.image_memory, nil)
+    defer vk.DestroyImage(renderer.device, texture.image, nil)
+    defer vk.DestroyImageView(renderer.device, texture.image_view, nil)
+}
+
+global_render_running :: proc() -> bool {
+    return !bool(glfw.WindowShouldClose(global_renderer.window))
+}
+
+global_render_handle_events :: proc() {
+    glfw.WaitEventsTimeout(0.001)
 }
 
 global_render_init :: proc() {
@@ -313,16 +419,32 @@ global_render_init :: proc() {
 
     }
 
+    { // COMMAND POOLS
+        using global_renderer
+        for pool, i in &global_command_pools {
+            if vk.CreateCommandPool(device, &vk.CommandPoolCreateInfo{
+                sType = .COMMAND_POOL_CREATE_INFO,
+                flags = {.RESET_COMMAND_BUFFER},
+                queueFamilyIndex = graphics_family,
+            }, nil, &pool) != .SUCCESS {
+                panic("Failed to create command pool!")
+            }
+
+            vk_assert(vk.AllocateCommandBuffers(device, &vk.CommandBufferAllocateInfo{
+                sType = .COMMAND_BUFFER_ALLOCATE_INFO,
+                commandPool = pool,
+                level = .PRIMARY,
+                commandBufferCount = MAX_FRAMES_IN_FLIGHT,
+            }, raw_data(global_command_buffers[i][:])))
+        }
+    }
+
+
+    // THESE THINGS BELOW ARE ACTUALLY PROGRAM SPECIFIC WHILE THE STUFF ABOVE
+    // CAN BE A BIT MORE GENERAL I THINK
+
     { // DESCRIPTOR SET LAYOUT
         using global_renderer
-        // graphics_layout := [?]vk.DescriptorSetLayoutBinding{
-        //     {
-        //         binding = 0,
-        //         descriptorCount = 1,
-        //         descriptorType = .COMBINED_IMAGE_SAMPLER,
-        //         stageFlags = {.FRAGMENT},
-        //     },
-        // }
         graphics_layout := [?]vk.DescriptorSetLayoutBinding{
             {
                 binding = 0,
@@ -330,6 +452,18 @@ global_render_init :: proc() {
                 descriptorType = .UNIFORM_BUFFER,
                 stageFlags = {.MESH_SHADER_EXT},
             },
+            {
+                binding = 1,
+                descriptorCount = 1,
+                descriptorType = .SAMPLER,
+                stageFlags = {.FRAGMENT},
+            },
+            {
+                binding = 2,
+                descriptorCount = 4,
+                descriptorType = .SAMPLED_IMAGE,
+                stageFlags = {.FRAGMENT},
+            }
         }
 
         if vk.CreateDescriptorSetLayout(device, &vk.DescriptorSetLayoutCreateInfo{
@@ -434,26 +568,6 @@ global_render_init :: proc() {
         }
     }
 
-    { // COMMAND POOLS
-        using global_renderer
-        for pool, i in &global_command_pools {
-            if vk.CreateCommandPool(device, &vk.CommandPoolCreateInfo{
-                sType = .COMMAND_POOL_CREATE_INFO,
-                flags = {.RESET_COMMAND_BUFFER},
-                queueFamilyIndex = graphics_family,
-            }, nil, &pool) != .SUCCESS {
-                panic("Failed to create command pool!")
-            }
-
-            vk_assert(vk.AllocateCommandBuffers(device, &vk.CommandBufferAllocateInfo{
-                sType = .COMMAND_BUFFER_ALLOCATE_INFO,
-                commandPool = pool,
-                level = .PRIMARY,
-                commandBufferCount = MAX_FRAMES_IN_FLIGHT,
-            }, raw_data(global_command_buffers[i][:])))
-        }
-    }
-
     { // Descriptor pool/sets
         using global_renderer
         pool_sizes := []vk.DescriptorPoolSize{
@@ -462,8 +576,12 @@ global_render_init :: proc() {
                 descriptorCount = u32(MAX_FRAMES_IN_FLIGHT),
             },
             {
-                type = .STORAGE_IMAGE,
-                descriptorCount = 2 * u32(MAX_FRAMES_IN_FLIGHT),
+                type = .UNIFORM_BUFFER,
+                descriptorCount = u32(MAX_FRAMES_IN_FLIGHT),
+            },
+            {
+                type = .SAMPLED_IMAGE,
+                descriptorCount = 4 * u32(MAX_FRAMES_IN_FLIGHT),
             },
         }
 
@@ -471,7 +589,7 @@ global_render_init :: proc() {
             sType = .DESCRIPTOR_POOL_CREATE_INFO,
             poolSizeCount = u32(len(pool_sizes)),
             pPoolSizes = raw_data(pool_sizes),
-            maxSets = 2 * u32(MAX_FRAMES_IN_FLIGHT),
+            maxSets = u32(MAX_FRAMES_IN_FLIGHT),
         }, nil, &descriptors.pool) != .SUCCESS {
             panic("Failed to create descriptor pool!")
         }
@@ -480,6 +598,13 @@ global_render_init :: proc() {
             descriptors.layout,
             descriptors.layout,
         }
+
+        vk_assert(vk.AllocateDescriptorSets(device, &vk.DescriptorSetAllocateInfo{
+            sType = .DESCRIPTOR_SET_ALLOCATE_INFO,
+            descriptorPool = descriptors.pool,
+            descriptorSetCount = u32(MAX_FRAMES_IN_FLIGHT),
+            pSetLayouts = raw_data(layouts[:]),
+        }, raw_data(descriptors.sets[:])))
     }
 
     { // SYNC OBJECTS
@@ -553,135 +678,6 @@ get_required_instance_extensions :: proc() -> (result: [dynamic]cstring) {
 	return
 }
 
-get_device :: proc(instance: vk.Instance) -> vk.Device {
-    return {}
-}
-
-framebuffer_resize_callback :: proc "c" (window: glfw.WindowHandle, width, height: i32) {
-}
-
-DEVICE_EXTENSION_LIST := [?]string{
-    vk.KHR_SWAPCHAIN_EXTENSION_NAME,
-    vk.KHR_DYNAMIC_RENDERING_EXTENSION_NAME,
-    vk.KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
-    vk.EXT_MESH_SHADER_EXTENSION_NAME,
-    vk.KHR_SPIRV_1_4_EXTENSION_NAME,
-    // vk.KHR_DEPTH_STENCIL_RESOLVE_EXTENSION_NAME,
-}
-
-INSTANCE_EXTENSION_LIST := [?]string{
-    // vk.KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
-}
-
-create_image :: proc(physical_device: vk.PhysicalDevice, device: vk.Device, width, height, mip_levels: u32, format: vk.Format, tiling: vk.ImageTiling, usage: vk.ImageUsageFlags, properties: vk.MemoryPropertyFlags) -> (image: vk.Image, memory: vk.DeviceMemory) {
-	if vk.CreateImage(device, &vk.ImageCreateInfo{
-		sType = .IMAGE_CREATE_INFO,
-		imageType = .D2,
-		extent = vk.Extent3D{width = width, height = height, depth = 1},
-		mipLevels = mip_levels,
-		arrayLayers = 1,
-		format = format,
-		tiling = tiling,
-		initialLayout = .UNDEFINED,
-		usage = usage,
-		sharingMode = .EXCLUSIVE,
-		samples = {._1},
-		flags = nil,
-	}, nil, &image) != .SUCCESS {
-		panic("Failed to create image!")
-	}
-
-	mem_requirements: vk.MemoryRequirements
-	vk.GetImageMemoryRequirements(device, image, &mem_requirements)
-
-	if vk.AllocateMemory(device, &vk.MemoryAllocateInfo{
-		sType = .MEMORY_ALLOCATE_INFO,
-		allocationSize = mem_requirements.size,
-		memoryTypeIndex = find_memory_type(physical_device, mem_requirements.memoryTypeBits, properties),
-	}, nil, &memory) != .SUCCESS {
-		panic("failed to allocate image memory!")
-	}
-
-	vk.BindImageMemory(device, image, memory, 0)
-	return
-}
-
-create_image_view :: proc(device: vk.Device, image: vk.Image, format: vk.Format, aspect_flags: vk.ImageAspectFlags, mip_levels: u32) -> (view: vk.ImageView) {
-	if vk.CreateImageView(device, &vk.ImageViewCreateInfo{
-		sType = .IMAGE_VIEW_CREATE_INFO,
-		image = image,
-		viewType = .D2,
-		format = format,
-		subresourceRange = {
-			aspectMask = aspect_flags,
-			baseMipLevel = 0,
-			levelCount = mip_levels,
-			baseArrayLayer = 0,
-			layerCount = 1,
-		},
-	}, nil, &view) != .SUCCESS {
-		panic("Failed to create texture image")
-	}
-	return
-}
-
-create_shader_module :: proc(device: vk.Device, code: []byte) -> (sm: vk.ShaderModule) {
-	if result := vk.CreateShaderModule(
-		   device,
-		   &vk.ShaderModuleCreateInfo{
-			   sType = .SHADER_MODULE_CREATE_INFO,
-			   codeSize = len(code),
-			   pCode = (^u32)(raw_data(code)),
-		   },
-		   nil,
-		   &sm,
-	   ); result != .SUCCESS {
-		panic("Failed to create shader module")
-	}
-	return
-}
-
-create_buffer :: proc(physical_device: vk.PhysicalDevice, device: vk.Device, size: vk.DeviceSize, usage: vk.BufferUsageFlags, properties: vk.MemoryPropertyFlags) -> (buffer: vk.Buffer, memory: vk.DeviceMemory) {
-	buffer_info := vk.BufferCreateInfo{
-		sType = .BUFFER_CREATE_INFO,
-		size = size,
-		usage = usage,
-		sharingMode = .EXCLUSIVE,
-	}
-
-	if vk.CreateBuffer(device, &buffer_info, nil, &buffer) != .SUCCESS {
-		fmt.panicf("Failed to create buffer: {%v, %v, %v}\n", size, usage, properties)
-	}
-
-	mem_requirements: vk.MemoryRequirements
-	vk.GetBufferMemoryRequirements(device, buffer, &mem_requirements)
-
-	alloc_info := vk.MemoryAllocateInfo{
-		sType = .MEMORY_ALLOCATE_INFO,
-		allocationSize = mem_requirements.size,
-		memoryTypeIndex = find_memory_type(physical_device, mem_requirements.memoryTypeBits, properties),
-	}
-
-	if vk.AllocateMemory(device, &alloc_info, nil, &memory) != .SUCCESS {
-		fmt.panicf("failed to allocate memory for the buffer: {%v, %v, %v}\n", size, usage, properties)
-	}
-
-	vk.BindBufferMemory(device, buffer, memory, 0)
-
-	return
-}
-
-destroy_buffer :: proc(device: vk.Device, buffer: vk.Buffer, memory: vk.DeviceMemory) {
-	defer vk.DestroyBuffer(device, buffer, nil)
-	defer  vk.FreeMemory(device, memory, nil)
-}
-
-copy_buffer :: proc(device: vk.Device, src, dst: vk.Buffer, copy_infos: []vk.BufferCopy) {
-	temp_command_buffer := scoped_single_time_commands(device, global_command_pools[int(_thread_global_handle)], global_renderer.main_queue)
-
-	vk.CmdCopyBuffer(temp_command_buffer, src, dst, u32(len(copy_infos)), raw_data(copy_infos))
-}
-
 @(deferred_in_out = end_single_time_commands)
 scoped_single_time_commands :: proc(device: vk.Device, command_pool: vk.CommandPool, submit_queue: vk.Queue) -> vk.CommandBuffer {
 	return begin_single_time_commands(device, command_pool, submit_queue)
@@ -722,87 +718,6 @@ end_single_time_commands :: proc(device: vk.Device, command_pool: vk.CommandPool
 	vk.FreeCommandBuffers(device, command_pool, 1, &buffer)
 }
 
-find_memory_type :: proc(physical_device: vk.PhysicalDevice, type_filter: u32, properties: vk.MemoryPropertyFlags) -> u32 {
-	mem_properties: vk.PhysicalDeviceMemoryProperties
-	vk.GetPhysicalDeviceMemoryProperties(physical_device, &mem_properties)
-
-	for i in 0..<mem_properties.memoryTypeCount {
-		if type_filter & (1 << i) != 0 && (mem_properties.memoryTypes[i].propertyFlags & properties == properties) {
-			return i
-		}
-	}
-
-	panic("Failed to find suitable memory type!")
-
-}
-
-transition_image_layout :: proc(device: vk.Device, queue: vk.Queue, image: vk.Image, format: vk.Format, old_layout, new_layout: vk.ImageLayout, mip_levels: u32) {
-	command_buffer := scoped_single_time_commands(device, global_command_pools[int(_thread_global_handle)], queue)
-	barrier := vk.ImageMemoryBarrier{
-		sType = .IMAGE_MEMORY_BARRIER,
-		oldLayout = old_layout,
-		newLayout = new_layout,
-		srcQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
-		dstQueueFamilyIndex = vk.QUEUE_FAMILY_IGNORED,
-		image = image,
-		subresourceRange = {
-			aspectMask = {.COLOR},
-			baseMipLevel = 0,
-			levelCount = mip_levels,
-			baseArrayLayer = 0,
-			layerCount = 1,
-		},
-		srcAccessMask = nil,
-		dstAccessMask = nil,
-	}
-
-	source_stage, destination_stage: vk.PipelineStageFlags
-
-	if old_layout == .UNDEFINED && new_layout == .TRANSFER_DST_OPTIMAL {
-		barrier.srcAccessMask = nil
-		barrier.dstAccessMask = nil
-		
-		source_stage = {.TOP_OF_PIPE}
-		destination_stage = {.TRANSFER}
-	} else if old_layout == .TRANSFER_DST_OPTIMAL && new_layout == .SHADER_READ_ONLY_OPTIMAL {
-		barrier.srcAccessMask = {.TRANSFER_WRITE}
-		barrier.dstAccessMask = {.SHADER_READ}
-
-		source_stage = {.TRANSFER}
-		destination_stage = {.FRAGMENT_SHADER}
-	} else {
-		panic("unsupported layout transition!")
-	}
-	vk.CmdPipelineBarrier(command_buffer, source_stage, destination_stage, {}, 0, nil, 0, nil, 1, &barrier)
-}
-
-debug_callback :: proc "system" (
-	message_severity: vk.DebugUtilsMessageSeverityFlagsEXT,
-	message_type: vk.DebugUtilsMessageTypeFlagsEXT,
-	p_callback_data: ^vk.DebugUtilsMessengerCallbackDataEXT,
-	p_user_data: rawptr,
-) -> b32 {
-	context = runtime.default_context()
-    fmt.println()
-    fmt.printf("MESSAGE: (")
-    for ms in vk.DebugUtilsMessageSeverityFlagEXT {
-        if ms in message_severity {
-            fmt.printf("%v, ", ms)
-        }
-    }
-    for t in vk.DebugUtilsMessageTypeFlagEXT {
-        if t in message_type {
-            fmt.printf("%v", t)
-        }
-    }
-    fmt.printf(")\n")
-    fmt.println("---------------")
-    fmt.printf("%#v\n", p_callback_data.pMessage)
-    fmt.println()
-
-	return false
-}
-
 Zoom_Event :: f64
 Drag_Start :: distinct struct {}
 Drag_End :: distinct struct {}
@@ -813,33 +728,4 @@ Simulator_Event :: union {
     Drag_Start,
     Drag_End,
     Mouse_Pos,
-}
-
-scroll_callback :: proc "c" (window: glfw.WindowHandle, xoffset, yoffset: f64) {
-    context = runtime.default_context()
-    fmt.println("scroll(", xoffset, yoffset, ")")
-    // sync.mutex_guard(&queue_lock)
-    // queue.push(&global_queue, yoffset)
-}
-
-cursor_pos_callback :: proc "c" (window: glfw.WindowHandle, xpos, ypos: f64) {
-    context = runtime.default_context()
-    fmt.println("cursor(", xpos, ypos, ")")
-    // sync.mutex_guard(&queue_lock)
-    // queue.push(&global_queue, [2]int{int(xpos), int(ypos)})
-}
-
-mouse_button_callback :: proc "c" (window: glfw.WindowHandle, button, action, mods: i32) {
-    context = runtime.default_context()
-    fmt.println("button(", button, action, mods, ")")
-    
-    if button == glfw.MOUSE_BUTTON_LEFT && action == glfw.PRESS {
-        fmt.println("ADDED")
-        // sync.mutex_guard(&queue_lock)
-        // queue.push(&global_queue, Drag_Start{})
-    } else if button == glfw.MOUSE_BUTTON_LEFT && action == glfw.RELEASE {
-        fmt.println("RELEASED!")
-        // sync.mutex_guard(&queue_lock)
-        // queue.push(&global_queue, Drag_End{})
-    }
 }

@@ -2,43 +2,62 @@
 #extension GL_EXT_mesh_shader : require
 
 layout (binding = 0) uniform UBO {
-    mat4 bird_translation;
-    mat4 column0_translation;
-    mat4 column1_translation1;
-} column_ubo;
+    vec4 bird;
+    vec4 column0;
+    vec4 column1;
+    vec4 padding;
+} game_ubo;
 
 layout (local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 layout (triangles, max_vertices = 48, max_primitives = 16) out;
 
-layout (location = 0) out VertexOutput {
-    vec4 color;
-} vertexColorOutput[];
+layout (location = 0) out VertexTextureOutput {
+    vec2 textureCoord;
+    ivec2 imageIdx;
+} vertexOut[];
 
-const vec2[4] column_offsets = {
-    vec2(-0.1, -1), vec2(-0.1, -0.1),
-    vec2(0.1, -1), vec2(0.1, -0.1)
-};
+void set_next_mesh_vertices(vec2 point, vec2 width_height, int starting_offset, int imageIdx) {
+    vec2 corners[4] = vec2[4](point - width_height, point + vec2(width_height.x, -width_height.y), point + vec2(-width_height.x, width_height.y), point + width_height);
+    gl_MeshVerticesEXT[starting_offset + 0].gl_Position = vec4(point + corners[0], 0.0, 1.0);
+    gl_MeshVerticesEXT[starting_offset + 1].gl_Position = vec4(point + corners[1], 0.0, 1.0);
+    gl_MeshVerticesEXT[starting_offset + 2].gl_Position = vec4(point + corners[2], 0.0, 1.0);
+
+    gl_MeshVerticesEXT[starting_offset + 3].gl_Position = vec4(point + corners[1], 0.0, 1.0);
+    gl_MeshVerticesEXT[starting_offset + 4].gl_Position = vec4(point + corners[3], 0.0, 1.0);
+    gl_MeshVerticesEXT[starting_offset + 5].gl_Position = vec4(point + corners[2], 0.0, 1.0);
+
+    vertexOut[starting_offset + 0].textureCoord = vec2(0, 0);
+    vertexOut[starting_offset + 0].imageIdx = ivec2(imageIdx, imageIdx);
+    vertexOut[starting_offset + 1].textureCoord = vec2(1, 0);
+    vertexOut[starting_offset + 1].imageIdx = ivec2(imageIdx, imageIdx);
+    vertexOut[starting_offset + 2].textureCoord = vec2(0, 1);
+    vertexOut[starting_offset + 2].imageIdx = ivec2(imageIdx, imageIdx);
+    vertexOut[starting_offset + 3].textureCoord = vec2(1, 0);
+    vertexOut[starting_offset + 3].imageIdx = ivec2(imageIdx, imageIdx);
+    vertexOut[starting_offset + 4].textureCoord = vec2(1, 1);
+    vertexOut[starting_offset + 4].imageIdx = ivec2(imageIdx, imageIdx);
+    vertexOut[starting_offset + 5].textureCoord = vec2(0, 1);
+    vertexOut[starting_offset + 5].imageIdx = ivec2(imageIdx, imageIdx);
+}
 
 void main()
 {
-    vec3 upper_left_corner = vec3(column_offsets[0], 1.0);
-    vec3 bottom_left_corner = vec3(column_offsets[1], 1.0);
-    vec3 upper_right_corner = vec3(column_offsets[2], 1.0);
-    vec3 bottom_right_corner = vec3(column_offsets[3], 1.0);
-    mat3 translation_matrix = mat3(column_ubo.column0_translation);
+    SetMeshOutputsEXT(3 * 6, 3 * 2);
 
-    SetMeshOutputsEXT(6, 2);
-    gl_MeshVerticesEXT[0].gl_Position = vec4((translation_matrix * upper_left_corner).xy, 0.0, 1.0);
-    gl_MeshVerticesEXT[1].gl_Position = vec4((translation_matrix * upper_right_corner).xy, 0.0, 1.0);
-    gl_MeshVerticesEXT[2].gl_Position = vec4((translation_matrix * bottom_left_corner).xy, 0.0, 1.0);
-    gl_MeshVerticesEXT[3].gl_Position = vec4((translation_matrix * upper_right_corner).xy, 0.0, 1.0);
-    gl_MeshVerticesEXT[4].gl_Position = vec4((translation_matrix * bottom_right_corner).xy, 0.0, 1.0);
-    gl_MeshVerticesEXT[5].gl_Position = vec4((translation_matrix * bottom_left_corner).xy, 0.0, 1.0);
-    vertexColorOutput[0].color = vec4(0.0, 1.0, 0.0, 1.0);
-    vertexColorOutput[1].color = vec4(0.0, 1.0, 0.0, 1.0);
-    vertexColorOutput[2].color = vec4(0.0, 1.0, 0.0, 1.0);
-    vertexColorOutput[3].color = vec4(0.0, 1.0, 0.0, 1.0);
-    vertexColorOutput[4].color = vec4(0.0, 1.0, 0.0, 1.0);
-    vertexColorOutput[5].color = vec4(0.0, 1.0, 0.0, 1.0);
+    // BIRD
+    set_next_mesh_vertices(game_ubo.bird.xy, game_ubo.bird.zw, 0, 0);
 
+
+    // COLUMN 0
+    set_next_mesh_vertices(game_ubo.column0.xy, game_ubo.column0.zw, 6, 1);
+
+    // COLUMN 1
+    set_next_mesh_vertices(game_ubo.column1.xy, game_ubo.column1.zw, 12, 1);
+
+    gl_PrimitiveTriangleIndicesEXT[0] = uvec3(0, 1, 2);
+    gl_PrimitiveTriangleIndicesEXT[1] = uvec3(3, 4, 5);
+    gl_PrimitiveTriangleIndicesEXT[2] = uvec3(6, 7, 8);
+    gl_PrimitiveTriangleIndicesEXT[3] = uvec3(9, 10, 11);
+    gl_PrimitiveTriangleIndicesEXT[4] = uvec3(12, 13, 14);
+    gl_PrimitiveTriangleIndicesEXT[5] = uvec3(15, 16, 17);
 }
