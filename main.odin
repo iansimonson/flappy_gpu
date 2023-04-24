@@ -7,30 +7,20 @@ import vk "vendor:vulkan"
 import stbi "vendor:stb/image"
 import "core:fmt"
 import "core:mem"
+import "core:time"
+import "core:math/rand"
 
 UniformData :: struct {
     bird: [4]f32,
+    bird_texture_coords: [4]f32,
     column0: [4]f32,
     column1: [4]f32,
-    padding: [4]f32,
+    stripes_texture_coords: [4]f32,
+    padding: [3][4]f32,
 }
 
-FLAPPY_OFFSETS := [2]int{
-    140, 100,
-}
-
-FLAPPY_ENDS := [2]int{
-    666, 226,
-}
-
-Frames := [][2]int{
-    {140, 100},
-    {315, 100},
-    {490, 100},
-}
-
-SIZES := [2]int{
-    175, 126
+FLAPPY_FULL_SIZE := [2]f32{
+    820.0, 328.0,
 }
 
 load_image :: proc(filename: cstring) -> (image: render.Image) {
@@ -47,20 +37,44 @@ free_image :: proc(image: render.Image) {
     stbi.image_free(raw_data(image.data))
 }
 
+load_texture :: proc(file_name: cstring) -> render.Texture {
+    img := load_image(file_name)
+    defer free_image(img)
+    txt := render.global_render_create_texture(img)
+    return txt
+}
+
+unload_texture :: proc(texture: render.Texture) {
+    render.global_render_destroy_texture(texture)
+}
+
+@(deferred_out = unload_texture)
+scope_texture :: proc(file_name: cstring) -> render.Texture {
+    return load_texture(file_name)
+}
+
+jump: bool
+
+State :: enum {
+    Idle,
+    Started,
+    Dead,
+}
+
+global_state: State
+
 main :: proc() {
     render.global_render_init()
     defer render.global_render_destroy()
 
+    glfw.SetMouseButtonCallback(render.global_renderer.window, mouse_callback)
 
-    flappy_image := load_image("./assets/flappy_bird_spritesheet.jpg")
-    defer free_image(flappy_image)
-    pipe_image := load_image("./assets/mario_pipe.png")
-    defer free_image(pipe_image)
+    flappy_texture := scope_texture("./assets/flappy_bird_spritesheet.jpg")
+    pipe_texture := scope_texture("./assets/mario_pipe.png")
+    ground_texture := scope_texture("./assets/Ground cover thing.png")
+    stripe_texture := scope_texture("./assets/shitty_stripes.png")
+    background_texture := scope_texture("./assets/background.png")
 
-    flappy_texture := render.global_render_create_texture(flappy_image)
-    defer render.global_render_destroy_texture(flappy_texture)
-    pipe_texture := render.global_render_create_texture(pipe_image)
-    defer render.global_render_destroy_texture(pipe_texture)
 
     write_handle := render.register_writer()
 
@@ -94,17 +108,39 @@ main :: proc() {
             panic("Could not create sampler")
         }
     }
+    defer vk.DestroySampler(render.global_renderer.device, sampler, nil)
 
-    game_data := UniformData{
-        bird = {-0.5, 0, 0.1, 0.1},
-        column0 = {0, 0, 0.3, 1.0},
-        column1 = {0.7, 0, 0.3, 1.0},
+    starting_column_locations := [2][4]f32{
+        {3.15, rand.float32_range(-0.7, 0.5), 0.15, 0.75},
+        {4.3, rand.float32_range(-0.7, 0.5), 0.15, 0.75},
     }
 
-    mem.copy(raw_uniform, &game_data, size_of(UniformData))
-    mem.copy(rawptr(uintptr(raw_uniform) + uintptr(size_of(UniformData))), &game_data, size_of(UniformData))
+    bird_animation := [4][4]f32{
+        {140.0 / FLAPPY_FULL_SIZE.x, 100.0 / FLAPPY_FULL_SIZE.y, 175.0/FLAPPY_FULL_SIZE.x, 126.0/FLAPPY_FULL_SIZE.y},
+        {(140.0 + 175.0) / FLAPPY_FULL_SIZE.x, 100.0 / FLAPPY_FULL_SIZE.y, 175.0/FLAPPY_FULL_SIZE.x, 126.0/FLAPPY_FULL_SIZE.y},
+        {(140.0 + 2 * 175.0) / FLAPPY_FULL_SIZE.x, 100.0 / FLAPPY_FULL_SIZE.y, 175.0/FLAPPY_FULL_SIZE.x, 126.0/FLAPPY_FULL_SIZE.y},
+        {(140.0 + 175.0) / FLAPPY_FULL_SIZE.x, 100.0 / FLAPPY_FULL_SIZE.y, 175.0/FLAPPY_FULL_SIZE.x, 126.0/FLAPPY_FULL_SIZE.y}, // goes back down
+    }
+
+    // columns should always be a distance of 1 apart
+    game_data := UniformData{
+        bird = {-0.1, 0, 0.12, 0.06},
+        bird_texture_coords = bird_animation[0],
+        column0 = starting_column_locations[0],
+        column1 = starting_column_locations[1],
+        stripes_texture_coords = {0, 0, 0.5, 1},
+    }
+
+    // fmt.println(game_data.bird_texture_coords)
+
+    mapped_game_data: [2]rawptr
+    mapped_game_data[0] = raw_uniform
+    mapped_game_data[1] = rawptr(uintptr(raw_uniform) + uintptr(size_of(UniformData)))
+    mem.copy(mapped_game_data[0], &game_data, size_of(UniformData))
+    mem.copy(mapped_game_data[1], &game_data, size_of(UniformData))
 
 
+    // I did this for 4 textures b/c I'll need more in a little bit
     image_infos := []vk.DescriptorImageInfo{
         {
             imageLayout = .SHADER_READ_ONLY_OPTIMAL,
@@ -116,12 +152,16 @@ main :: proc() {
         },
         {
             imageLayout = .SHADER_READ_ONLY_OPTIMAL,
-            imageView = pipe_texture.image_view,
+            imageView = ground_texture.image_view,
         },
         {
             imageLayout = .SHADER_READ_ONLY_OPTIMAL,
-            imageView = pipe_texture.image_view,
+            imageView = stripe_texture.image_view,
         },
+        {
+            imageLayout = .SHADER_READ_ONLY_OPTIMAL,
+            imageView = background_texture.image_view,
+        }
     }
 
     for i in 0..<render.MAX_FRAMES_IN_FLIGHT {
@@ -163,14 +203,98 @@ main :: proc() {
         vk.UpdateDescriptorSets(render.global_renderer.device, u32(len(descriptor_sets)), raw_data(descriptor_sets), 0, nil)
     }
 
+    previous_time := time.now()
+
     step: int
+    gravity := f32(3.0)
+    velocity := f32(0)
+    score: int
+    scored: [2]bool
+    animation_time: f64 = 0
     for {
         using render.global_renderer
+        // fmt.printf("STEP: %v\nGame State:\n%#v", step, game_data)
+        current_frame := step % render.MAX_FRAMES_IN_FLIGHT
+        now := time.now()
+        diff := time.diff(previous_time, now)
+        seconds := time.duration_seconds(diff)
+        previous_time = now
+        column_change := [4]f32{-f32(seconds / 4.5) * 2.0, 0, 0, 0}
+
+        animation_time += seconds * 10
+        bird_frame := int(animation_time) % 4
+        game_data.bird_texture_coords = bird_animation[bird_frame]
+
+        game_data.stripes_texture_coords -= column_change / 4.3
+        if game_data.stripes_texture_coords.x > 0.5 {
+            game_data.stripes_texture_coords.x = 0
+        }
+
+        switch global_state {
+        case .Started:
+            hit_column :: proc(bird, column: [4]f32) -> bool {
+                within_box_x := bird.x + bird.z >= column.x - column.z && bird.x - bird.z <= column.x + column.z
+                within_box_y := bird.y - bird.w >= column.y - 0.25 && bird.y + bird.w <= column.y + 0.25
+
+                if within_box_x do return !within_box_y
+                else do return false
+            }
+
+            hit_ground :: proc(bird: [4]f32) -> bool {
+                return bird.y + bird.w >= 0.8
+            }
+
+            using game_data
+            if jump {
+                velocity = clamp(velocity + -1.4, -2.0, -1)
+                jump = false
+            }
+
+            velocity += f32(seconds) * gravity
+            bird.y += velocity*f32(seconds)
+    
+    
+            column0 += column_change
+            column1 += column_change
+            if column0.x < (-1 - column0.z) {
+                column0.x = 1.0 + column0.z
+                column0.y = rand.float32_range(-0.7, 0.5)
+                scored[0] = false
+            }
+            if column1.x < (-1 - column1.z) {
+                column1.x = 1.0 + column1.z
+                column1.y = rand.float32_range(-0.7, 0.5)
+                scored[0] = false
+            }
+
+            if column0.x < bird.x {
+                score += int(!scored[0])
+                scored[0] = true
+            }
+            if column1.x < bird.x {
+                score += int(!scored[1])
+                scored[1] = true
+            }
+
+            if hit_column(bird, column0) || hit_column(bird, column1) || hit_ground(bird) {
+                fmt.printf("bird:\n%#v\ncolum0:\n%#v\ncolumn1:\n%#v", bird, column0, column1)
+                fmt.println("GAME OVER")
+                fmt.println("SCORE:", score)
+                column0 = starting_column_locations[0]
+                column1 = starting_column_locations[1]
+                scored = false
+                bird.y = 0
+                score = 0
+                global_state = .Dead
+            }
+        case .Dead:
+            // TODO: print "best"
+        case .Idle:
+        }
 
         render.global_render_handle_events()
         if !render.global_render_running() do break
 
-        current_frame := step % render.MAX_FRAMES_IN_FLIGHT
         vk.WaitForFences(device, 1, &syncs.inflight_fences[current_frame], true, max(u64))
 
         image_index: u32 = max(u32)
@@ -184,6 +308,8 @@ main :: proc() {
 
         assert(image_index == u32(current_frame))
         vk.ResetFences(device, 1, &syncs.inflight_fences[current_frame])
+
+        mem.copy(mapped_game_data[current_frame], &game_data, size_of(UniformData))
 
         command_buffer := render.get_command_buffer(write_handle, current_frame)
         render.vk_assert(vk.BeginCommandBuffer(command_buffer, &vk.CommandBufferBeginInfo{
@@ -288,48 +414,16 @@ main :: proc() {
         }))
 
         step += 1
-        fmt.println("step!")
     }
+    vk.DeviceWaitIdle(render.global_renderer.device)
 
 }
 
-general := `
-Single point for flappy bird location
-Flappy Bird width/height (constants, radius?)
-
-Two points for the current column location
-Column width (radius) / inter-column height (also radius) (constants)
-
-constant vertices for the background/squares/little bar that moves
-
-compute shader for determining if game over?
-
-then need to figure out the truetype thing
-`
-
-GOAL := `
-
-The purpose of this is to make a flappy bird clone. So the window should be phone vertical size / aspect ratio
-Flappy bird only has 2 sets of columns, the ones you're going through and the other ones.
-Once the closest columns go off screen to the left the new ones appear on the right (when right side of column crosses edge of screen reset to edge of other screen)
-
-Maybe we can learn mmesh/task shaders? I'd like to put almost everything on compute shaders each frame
-
-Couple plans could be:
-1. Mesh shader that converts a single point to the 2 rectangles of the column?
-2. 
-
-1. Make a box
-2. Make 4 boxes for the columns
-3. Columns randomize center height and then they just go until offscreen
-4. It'll essentially be a UBO for each point/column, yeah that makes sense
-
-
-
-background -> fixed
-2 points for the columns
-1 point for the bird
-foreground rectangles (ground) -> fixed at first
-
-Counter (stb_truetype? look this up later)
-`
+mouse_callback :: proc "c" (window: glfw.WindowHandle, button, action, mods: i32) {
+    if button == glfw.MOUSE_BUTTON_LEFT && action == glfw.PRESS {
+        jump = true
+        if global_state == .Idle || global_state == .Dead {
+            global_state = .Started
+        }
+    }
+}

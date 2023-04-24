@@ -1,63 +1,119 @@
 #version 460
 #extension GL_EXT_mesh_shader : require
+#extension GL_EXT_nonuniform_qualifier : enable
+
+/*
+NOTE: this mesh shader requires specifying the target vulkan environment as at least 1.3
+i.e. --target-env=vulkan1.3
+*/
+
 
 layout (binding = 0) uniform UBO {
     vec4 bird;
+    vec4 bird_texture_coords;
     vec4 column0;
     vec4 column1;
-    vec4 padding;
+    vec4 stripes_texture_coords;
+    vec4 padding0;
+    vec4 padding1;
+    vec4 padding2;
 } game_ubo;
 
 layout (local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
 layout (triangles, max_vertices = 48, max_primitives = 16) out;
 
-layout (location = 0) out VertexTextureOutput {
-    vec2 textureCoord;
-    ivec2 imageIdx;
-} vertexOut[];
+layout (location = 0) out vec2 textureCoord[];
 
-void set_next_mesh_vertices(vec2 point, vec2 width_height, int starting_offset, int imageIdx) {
-    vec2 corners[4] = vec2[4](point - width_height, point + vec2(width_height.x, -width_height.y), point + vec2(-width_height.x, width_height.y), point + width_height);
-    gl_MeshVerticesEXT[starting_offset + 0].gl_Position = vec4(point + corners[0], 0.0, 1.0);
-    gl_MeshVerticesEXT[starting_offset + 1].gl_Position = vec4(point + corners[1], 0.0, 1.0);
-    gl_MeshVerticesEXT[starting_offset + 2].gl_Position = vec4(point + corners[2], 0.0, 1.0);
+// this needs to be "flat" so that the image index is applied to all entities in the
+// fragment shader. If you do not mark this as flat then the pipeline will interpolate
+// between image indices and you'll basically always get 0 since this is an integer
+layout (location = 1) out flat int polyImageIdx[];
 
-    gl_MeshVerticesEXT[starting_offset + 3].gl_Position = vec4(point + corners[1], 0.0, 1.0);
-    gl_MeshVerticesEXT[starting_offset + 4].gl_Position = vec4(point + corners[3], 0.0, 1.0);
-    gl_MeshVerticesEXT[starting_offset + 5].gl_Position = vec4(point + corners[2], 0.0, 1.0);
+// NOTE: these are in columns, not rows!
+const mat3 rotation = mat3(-1, 0, 0, 0, -1, 0, 0, 0, 1); // 180 degrees
+const mat3 identity = mat3(1, 0, 0, 0, 1, 0, 0, 0, 1);
 
-    vertexOut[starting_offset + 0].textureCoord = vec2(0, 0);
-    vertexOut[starting_offset + 0].imageIdx = ivec2(imageIdx, imageIdx);
-    vertexOut[starting_offset + 1].textureCoord = vec2(1, 0);
-    vertexOut[starting_offset + 1].imageIdx = ivec2(imageIdx, imageIdx);
-    vertexOut[starting_offset + 2].textureCoord = vec2(0, 1);
-    vertexOut[starting_offset + 2].imageIdx = ivec2(imageIdx, imageIdx);
-    vertexOut[starting_offset + 3].textureCoord = vec2(1, 0);
-    vertexOut[starting_offset + 3].imageIdx = ivec2(imageIdx, imageIdx);
-    vertexOut[starting_offset + 4].textureCoord = vec2(1, 1);
-    vertexOut[starting_offset + 4].imageIdx = ivec2(imageIdx, imageIdx);
-    vertexOut[starting_offset + 5].textureCoord = vec2(0, 1);
-    vertexOut[starting_offset + 5].imageIdx = ivec2(imageIdx, imageIdx);
+// when we do a rotation we want to rotate the generated quad around the center point
+// that was used to generate the quad, not around the global origin
+// so we have to perform a translation first
+vec4 adjust_vertex(vec2 point, vec2 rotation_point, mat3 rotate) {
+    vec3 as_vec3 = vec3(point.xy, 1);
+    mat3 to_origin = mat3(1, 0, 0, 0, 1, 0, -rotation_point.x, -rotation_point.y, 1);
+    mat3 from_origin = mat3(1, 0, 0, 0, 1, 0, rotation_point.x, rotation_point.y, 1);
+
+    return vec4((from_origin * rotate * to_origin * as_vec3).xy, 0, 1);
 }
 
+void set_next_mesh_vertices(vec2 point, vec2 width_height, vec2 texture_top_left, vec2 texture_width_height, int starting_offset, int imageIdx, mat3 rotate) {
+    vec2 corners[4] = vec2[4](point - width_height, point + vec2(width_height.x, -width_height.y), point + vec2(-width_height.x, width_height.y), point + width_height);
+    
+    int offsets[4] = int[4](starting_offset, starting_offset + 1, starting_offset + 2, starting_offset + 3);
+
+    gl_MeshVerticesEXT[offsets[0]].gl_Position = adjust_vertex(corners[0], point, rotate);
+    gl_MeshVerticesEXT[offsets[1]].gl_Position = adjust_vertex(corners[1], point, rotate);
+    gl_MeshVerticesEXT[offsets[2]].gl_Position = adjust_vertex(corners[2], point, rotate);
+    gl_MeshVerticesEXT[offsets[3]].gl_Position = adjust_vertex(corners[3], point, rotate);
+
+    textureCoord[offsets[0]] = texture_top_left;
+    polyImageIdx[offsets[0]] = imageIdx;
+    textureCoord[offsets[1]] = texture_top_left + vec2(texture_width_height.x, 0);
+    polyImageIdx[offsets[1]] = imageIdx;
+    textureCoord[offsets[2]] = texture_top_left + vec2(0, texture_width_height.y);
+    polyImageIdx[offsets[2]] = imageIdx;
+    textureCoord[offsets[3]] = texture_top_left + texture_width_height;
+    polyImageIdx[offsets[3]] = imageIdx;
+
+    int triangle_idx = starting_offset / 2;
+    gl_PrimitiveTriangleIndicesEXT[triangle_idx] = uvec3(offsets[0], offsets[1], offsets[2]);
+    gl_PrimitiveTriangleIndicesEXT[triangle_idx + 1] = uvec3(offsets[1], offsets[3], offsets[2]);
+}
+
+/*
+
+The following generates all vertices and texture mappings for a frame
+The input is all run by game_ubo type which contains the following:
+    1. Bird location (2d, xy) and directional radii (width, height in zw)
+    2. bird texture coordinates and width/height in texture space (this is because we have an animation of 3 frames)
+    2. Column 0 location (2d, xy) and directional radii (zw)
+    3. column 1 location (2d, xy) and direcitonal radii (zw)
+    4. stripes texture coordinates (to make the stripy ground thing "animate")
+
+NOTE: the columns are just single points and the width/height is actually for the generated box sizes.
+The column's box size is actually 0.5 height total (0.25 in each direction) and is animated by sliding the x coordinate
+and randomizing the y coordinate on animation start.
+
+Essentially the game logic on the CPU tracks if the bird's box passes cleanly within the column's box.
+The pipes themselves are purely visual
+
+This mesh shader generates vertices to create pipes that are outside the column's box
+And then generates the ground over the pipe so it looks correct
+
+The pipeline could probably set up a depth stencil and render the objects with depth to avoid needing to render in order
+but this was easier to set up
+*/
 void main()
 {
-    SetMeshOutputsEXT(3 * 6, 3 * 2);
+    SetMeshOutputsEXT(8 * 4, 8 * 2);
+
+    // Background
+    set_next_mesh_vertices(vec2(0, -0.25), vec2(1, 1.2), vec2(0, 0), vec2(1, 1), 0, 4, identity);
 
     // BIRD
-    set_next_mesh_vertices(game_ubo.bird.xy, game_ubo.bird.zw, 0, 0);
+    set_next_mesh_vertices(game_ubo.bird.xy, game_ubo.bird.zw, game_ubo.bird_texture_coords.xy, game_ubo.bird_texture_coords.zw, 4, 0, identity);
 
-
+    vec2 column0_offset = vec2(0, 0.25 + game_ubo.column0.w);
+    vec2 column1_offset = vec2(0, 0.25 + game_ubo.column1.w);
     // COLUMN 0
-    set_next_mesh_vertices(game_ubo.column0.xy, game_ubo.column0.zw, 6, 1);
+    set_next_mesh_vertices(game_ubo.column0.xy - column0_offset, game_ubo.column0.zw, vec2(0, 0), vec2(1, 1), 8, 1, rotation);
+    set_next_mesh_vertices(game_ubo.column0.xy + column0_offset, game_ubo.column0.zw, vec2(0, 0), vec2(1, 1), 12, 1, identity);
 
     // COLUMN 1
-    set_next_mesh_vertices(game_ubo.column1.xy, game_ubo.column1.zw, 12, 1);
+    set_next_mesh_vertices(game_ubo.column1.xy - column1_offset, game_ubo.column1.zw, vec2(0, 0), vec2(1, 1), 16, 1, rotation);
+    set_next_mesh_vertices(game_ubo.column1.xy + column1_offset, game_ubo.column1.zw, vec2(0, 0), vec2(1, 1), 20, 1, identity);
 
-    gl_PrimitiveTriangleIndicesEXT[0] = uvec3(0, 1, 2);
-    gl_PrimitiveTriangleIndicesEXT[1] = uvec3(3, 4, 5);
-    gl_PrimitiveTriangleIndicesEXT[2] = uvec3(6, 7, 8);
-    gl_PrimitiveTriangleIndicesEXT[3] = uvec3(9, 10, 11);
-    gl_PrimitiveTriangleIndicesEXT[4] = uvec3(12, 13, 14);
-    gl_PrimitiveTriangleIndicesEXT[5] = uvec3(15, 16, 17);
+    // Ground
+    set_next_mesh_vertices(vec2(0, 0.9), vec2(1, 0.1), vec2(0, 0), vec2(1, 1), 24, 2, identity);
+
+    // Stripes
+    set_next_mesh_vertices(vec2(0, 0.8), vec2(1, 0.03), game_ubo.stripes_texture_coords.xy, game_ubo.stripes_texture_coords.zw, 28, 3, identity);
 }

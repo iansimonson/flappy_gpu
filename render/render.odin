@@ -15,8 +15,8 @@ hello :: proc() {
     fmt.println("hello from render!")
 }
 
-WIDTH :: 400
-HEIGHT :: 600
+WIDTH :: 500
+HEIGHT :: 700
 
 ENABLE_VALIDATION_LAYERS :: ODIN_DEBUG || #config(ENABLE_VALIDATION_LAYERS, false)
 
@@ -227,14 +227,14 @@ global_render_init :: proc() {
     vk.load_proc_addresses_global(rawptr(glfw.GetInstanceProcAddress))
     glfw.WindowHint(glfw.CLIENT_API, glfw.NO_API)
 
-    global_renderer.window = glfw.CreateWindow(WIDTH, HEIGHT, "Hello Dynamic Rendering Vulkan", nil, nil)
+    global_renderer.window = glfw.CreateWindow(WIDTH, HEIGHT, "Janky Flappy Bird Mesh Shader", nil, nil)
 	assert(global_renderer.window != nil, "Window could not be crated")
 
     glfw.SetWindowUserPointer(global_renderer.window, &global_renderer)
 	glfw.SetFramebufferSizeCallback(global_renderer.window, framebuffer_resize_callback)
 
-    glfw.SetScrollCallback(global_renderer.window, scroll_callback)
-    glfw.SetCursorPosCallback(global_renderer.window, cursor_pos_callback)
+    // glfw.SetScrollCallback(global_renderer.window, scroll_callback)
+    // glfw.SetCursorPosCallback(global_renderer.window, cursor_pos_callback)
     glfw.SetMouseButtonCallback(global_renderer.window, mouse_button_callback)
 
     instance_extension := get_required_instance_extensions()
@@ -362,6 +362,10 @@ global_render_init :: proc() {
                         pNext = &vk.PhysicalDeviceMaintenance4Features{
                             sType = .PHYSICAL_DEVICE_MAINTENANCE_4_FEATURES,
                             maintenance4 = true,
+                            pNext = &vk.PhysicalDeviceVulkan12Features{
+                                sType = .PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+                                descriptorIndexing = true,
+                            }
                         },
                     },
                 },
@@ -460,7 +464,7 @@ global_render_init :: proc() {
             },
             {
                 binding = 2,
-                descriptorCount = 4,
+                descriptorCount = 5,
                 descriptorType = .SAMPLED_IMAGE,
                 stageFlags = {.FRAGMENT},
             }
@@ -529,7 +533,8 @@ global_render_init :: proc() {
             colorBlendOp = .ADD,
             srcAlphaBlendFactor = .ONE,
             dstAlphaBlendFactor = .ZERO,
-            alphaBlendOp = .ADD,
+            alphaBlendOp = .SUBTRACT,
+            blendEnable = true,
         }
     
         color_blending := vk.PipelineColorBlendStateCreateInfo {
