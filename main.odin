@@ -161,7 +161,7 @@ main :: proc() {
         {
             imageLayout = .SHADER_READ_ONLY_OPTIMAL,
             imageView = background_texture.image_view,
-        }
+        },
     }
 
     for i in 0..<render.MAX_FRAMES_IN_FLIGHT {
