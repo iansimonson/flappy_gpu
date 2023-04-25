@@ -16,7 +16,9 @@ UniformData :: struct {
     column0: [4]f32,
     column1: [4]f32,
     stripes_texture_coords: [4]f32,
-    padding: [3][4]f32,
+    render_points: b32,
+    padding0: [3]f32,
+    padding: [2][4]f32,
 }
 
 FLAPPY_FULL_SIZE := [2]f32{
@@ -54,6 +56,7 @@ scope_texture :: proc(file_name: cstring) -> render.Texture {
 }
 
 jump: bool
+render_points: bool
 
 State :: enum {
     Idle,
@@ -68,12 +71,14 @@ main :: proc() {
     defer render.global_render_destroy()
 
     glfw.SetMouseButtonCallback(render.global_renderer.window, mouse_callback)
+    glfw.SetKeyCallback(render.global_renderer.window, key_callback)
 
     flappy_texture := scope_texture("./assets/flappy_bird_spritesheet.jpg")
     pipe_texture := scope_texture("./assets/mario_pipe.png")
     ground_texture := scope_texture("./assets/Ground cover thing.png")
     stripe_texture := scope_texture("./assets/shitty_stripes.png")
     background_texture := scope_texture("./assets/background.png")
+    red_texture := scope_texture("./assets/red.png")
 
 
     write_handle := render.register_writer()
@@ -129,6 +134,7 @@ main :: proc() {
         column0 = starting_column_locations[0],
         column1 = starting_column_locations[1],
         stripes_texture_coords = {0, 0, 0.5, 1},
+        render_points = b32(render_points),
     }
 
     // fmt.println(game_data.bird_texture_coords)
@@ -161,6 +167,10 @@ main :: proc() {
         {
             imageLayout = .SHADER_READ_ONLY_OPTIMAL,
             imageView = background_texture.image_view,
+        },
+        {
+            imageLayout = .SHADER_READ_ONLY_OPTIMAL,
+            imageView = red_texture.image_view,
         },
     }
 
@@ -229,6 +239,8 @@ main :: proc() {
         if game_data.stripes_texture_coords.x > 0.5 {
             game_data.stripes_texture_coords.x = 0
         }
+
+        game_data.render_points = b32(render_points)
 
         switch global_state {
         case .Started:
@@ -425,5 +437,11 @@ mouse_callback :: proc "c" (window: glfw.WindowHandle, button, action, mods: i32
         if global_state == .Idle || global_state == .Dead {
             global_state = .Started
         }
+    }
+}
+
+key_callback :: proc "c" (window: glfw.WindowHandle, key, scancode, action, mods: i32) {
+    if key == glfw.KEY_S && action == glfw.PRESS {
+        render_points = !render_points
     }
 }

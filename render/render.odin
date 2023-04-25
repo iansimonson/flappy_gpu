@@ -363,7 +363,7 @@ global_render_init :: proc() {
                             pNext = &vk.PhysicalDeviceVulkan12Features{
                                 sType = .PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
                                 descriptorIndexing = true,
-                            }
+                            },
                         },
                     },
                 },
@@ -462,7 +462,7 @@ global_render_init :: proc() {
             },
             {
                 binding = 2,
-                descriptorCount = 5,
+                descriptorCount = 6,
                 descriptorType = .SAMPLED_IMAGE,
                 stageFlags = {.FRAGMENT},
             }
